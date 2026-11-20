@@ -32,7 +32,10 @@ use tokio_sse_codec::{Event, Frame as SseFrame, SseDecoder};
 use tokio_util::codec::Decoder;
 use tracing::warn;
 
-use super::{FailureMode, ResponseGuard, StreamingEvaluator, StreamingGuardrailOutcome};
+use super::{
+	FailureMode, GuardObserver, ResponseGuard, StreamingEvaluator, StreamingGuardrailOutcome,
+	record_capability_observation,
+};
 use crate::cel::RequestSnapshot;
 use crate::llm::policy::{Policy, PromptGuard};
 use crate::proxy::httpproxy::PolicyClient;
@@ -99,6 +102,14 @@ async fn evaluate_windows(
 	(evaluators, None)
 }
 
+/// Flush per-response telemetry for every evaluator. Call at each response
+/// boundary; a websocket connection has many, an SSE body exactly one.
+pub fn finish_evaluators(evaluators: &mut [Box<dyn StreamingEvaluator>]) {
+	for ev in evaluators.iter_mut() {
+		ev.finish_response();
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
@@ -110,6 +121,7 @@ pub fn make_evaluator(
 	http_headers: HeaderMap,
 	original: Option<Arc<RequestSnapshot>>,
 	guardrail_log: GuardrailLog,
+	observer: Option<GuardObserver>,
 ) -> Box<dyn StreamingEvaluator> {
 	Box::new(ResponseGuardEvaluator {
 		guard: guard.clone(),
@@ -117,7 +129,10 @@ pub fn make_evaluator(
 		http_headers,
 		original,
 		guardrail_log,
-		worst_action: GuardrailAction::Allow,
+		observer,
+		lifetime_worst_action: GuardrailAction::Allow,
+		response_worst_action: GuardrailAction::Allow,
+		evaluated: false,
 	})
 }
 
@@ -127,25 +142,61 @@ struct ResponseGuardEvaluator {
 	http_headers: HeaderMap,
 	original: Option<Arc<RequestSnapshot>>,
 	guardrail_log: GuardrailLog,
-	// Fold window results into one metric for the stream.
-	worst_action: GuardrailAction,
+	observer: Option<GuardObserver>,
+	// Two folds over the same window verdicts, at two granularities. The guardrail
+	// metric keeps its pre-existing per-evaluator-lifetime semantics, so its
+	// accumulator is never reset; the capability observation is per response, so
+	// its accumulator resets at each boundary. Sharing one field between them
+	// silently reported a blocked stream as `Allow`.
+	lifetime_worst_action: GuardrailAction,
+	response_worst_action: GuardrailAction,
+	// Whether any window has been evaluated since the last response boundary.
+	// Guards against emitting an `Allow` observation for a response that never
+	// produced text, and makes the `Drop` backstop idempotent.
+	evaluated: bool,
 }
 
 impl ResponseGuardEvaluator {
 	fn observe_action(&mut self, action: GuardrailAction) {
-		self.worst_action = self.worst_action.max(action);
+		self.lifetime_worst_action = self.lifetime_worst_action.max(action);
+		self.response_worst_action = self.response_worst_action.max(action);
 	}
 }
 
 impl Drop for ResponseGuardEvaluator {
 	fn drop(&mut self) {
-		Policy::record_guardrail_trip(&self.client, GuardrailPhase::Response, self.worst_action);
+		// The two folds deliberately differ in granularity. The guardrail metric keeps its
+		// pre-existing per-evaluator-lifetime semantics, which on a realtime websocket means one
+		// trip for a whole connection. The capability observation is per response, so it goes
+		// through `finish_response`, which no-ops when the last response already flushed; here it
+		// is only the backstop for a stream that ends without a boundary (client disconnect,
+		// upstream error).
+		Policy::record_guardrail_trip(
+			&self.client,
+			GuardrailPhase::Response,
+			self.lifetime_worst_action,
+		);
+		self.finish_response();
 	}
 }
 
 impl StreamingEvaluator for ResponseGuardEvaluator {
 	fn failure_mode(&self) -> FailureMode {
 		self.guard.failure_mode()
+	}
+
+	fn finish_response(&mut self) {
+		if !self.evaluated {
+			return;
+		}
+		record_capability_observation(
+			self.observer.as_ref(),
+			self.original.as_deref(),
+			self.guard.kind.name(),
+			self.response_worst_action,
+		);
+		self.response_worst_action = GuardrailAction::Allow;
+		self.evaluated = false;
 	}
 
 	fn evaluate<'a>(
@@ -167,6 +218,7 @@ impl StreamingEvaluator for ResponseGuardEvaluator {
 			.await
 			{
 				Ok((outcome, action)) => {
+					self.evaluated = true;
 					self.observe_action(action);
 					Ok(outcome)
 				},
@@ -182,6 +234,8 @@ impl StreamingEvaluator for ResponseGuardEvaluator {
 						action,
 						None,
 					);
+					// An error is a verdict too, so the boundary must flush it.
+					self.evaluated = true;
 					self.observe_action(action);
 					Err(e)
 				},
@@ -432,6 +486,7 @@ impl http_body::Body for GuardedSseBody {
 					if let Some(frame) = queue.pop_front() {
 						return Poll::Ready(Some(Ok(Frame::data(frame))));
 					} else if *eof {
+						finish_evaluators(this.evaluators);
 						*this.state = GuardedBodyState::Done;
 						return Poll::Ready(None);
 					} else {
@@ -443,6 +498,8 @@ impl http_body::Body for GuardedSseBody {
 				// -----------------------------------------------------------------
 				GuardedBodyState::Blocked(body) => {
 					let body = std::mem::take(body);
+					// A blocked stream is a finished response too; its folded action is the reject.
+					finish_evaluators(this.evaluators);
 					*this.state = GuardedBodyState::Done;
 					return Poll::Ready(Some(Ok(Frame::data(guardrail_blocked_sse_bytes(body)))));
 				},

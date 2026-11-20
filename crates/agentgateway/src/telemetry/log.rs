@@ -400,6 +400,8 @@ pub struct Config {
 	/// Compiled `standardAttributes.session`, replaced on config reload.
 	#[serde(skip)]
 	pub session: Arc<arc_swap::ArcSwapOption<cel::Expression>>,
+	/// Emit a capability observation for each authorization decision.
+	pub capability_observations: bool,
 	/// Level sets the level for logs
 	pub level: String,
 	/// Format sets the logging format (text or json)
@@ -575,6 +577,7 @@ pub struct CelLogging {
 	pub standard_attributes: LoggingFields,
 	pub database_fields: LoggingFields,
 	pub metric_fields: MetricFields,
+	pub capability_observations: bool,
 }
 
 pub struct CelLoggingExecutor<'a> {
@@ -745,6 +748,7 @@ impl CelLogging {
 			standard_attributes,
 			database_fields: LoggingFields::default(),
 			metric_fields: metrics.metric_fields,
+			capability_observations: cfg.capability_observations,
 		}
 	}
 
@@ -768,6 +772,7 @@ impl CelLogging {
 			standard_attributes,
 			database_fields,
 			metric_fields,
+			capability_observations: _,
 		} = self;
 		let mut executor = if inputs.req.is_none() && inputs.source_context.is_some() {
 			// TCP case: use new_tcp_logger
@@ -1159,6 +1164,7 @@ impl RequestLog {
 			health_policy: None,
 			retry_backoff: None,
 			jwt_sub: None,
+			policy_phase: None,
 			retry_attempt: None,
 			error: None,
 			grpc_status: Default::default(),
@@ -1326,6 +1332,10 @@ pub struct RequestLog {
 	pub bind_name: Option<BindKey>,
 	pub listener_name: Option<ListenerName>,
 	pub route_name: Option<RouteName>,
+	/// Name of the policy currently being applied, set by the policy wrappers so a
+	/// decision can say which application point produced it. One request passes
+	/// several authorization points, and their records are otherwise identical.
+	pub policy_phase: Option<&'static str>,
 	pub backend_info: Option<BackendInfo>,
 	pub backend_protocol: Option<cel::BackendProtocol>,
 
@@ -2587,7 +2597,7 @@ impl OtelAccessLogger {
 		let _ = self.inner.provider.shutdown();
 	}
 
-	fn emit<'v>(&self, level: &str, _target: &str, kv: &[(&str, Option<ValueBag<'v>>)]) {
+	pub(crate) fn emit<'v>(&self, level: &str, _target: &str, kv: &[(&str, Option<ValueBag<'v>>)]) {
 		let severity = match level {
 			"error" => Severity::Error,
 			"warn" => Severity::Warn,
@@ -3047,6 +3057,7 @@ mod tests {
 
 	fn test_request_log_with_registry() -> (RequestLog, Registry) {
 		let cel = CelLogging {
+			capability_observations: false,
 			cel_context: crate::cel::ContextBuilder::new(),
 			filter: None,
 			fields: LoggingFields::default(),

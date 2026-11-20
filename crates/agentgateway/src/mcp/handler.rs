@@ -409,7 +409,7 @@ impl Relay {
 			let mut resource_allowed = |uri: &str| {
 				// rewrite_tool_list_ui_meta extracts app URIs from tool metadata, apply RBAC against
 				// these UI resources
-				policies.validate(
+				policies.validate_observed(
 					&rbac::ResourceType::Resource(rbac::ResourceId::new(target.clone(), uri.to_string())),
 					// rewrite_tool_list_ui_meta only ever invokes this closure when the message it's
 					// rewriting is itself a ListToolsResult, so this check only ever fires for a
@@ -827,7 +827,7 @@ impl Relay {
 						.into_iter()
 						// Apply authorization policies, filtering tools that are not allowed.
 						.filter(|t| {
-							policies.validate(
+							policies.validate_observed(
 								&rbac::ResourceType::Tool(rbac::ResourceId::new(
 									server_name.to_string(),
 									t.name.to_string(),
@@ -1004,7 +1004,7 @@ impl Relay {
 					prompts
 						.into_iter()
 						.filter(|p| {
-							policies.validate(
+							policies.validate_observed(
 								&rbac::ResourceType::Prompt(rbac::ResourceId::new(
 									server_name.to_string(),
 									p.name.to_string(),
@@ -1046,7 +1046,7 @@ impl Relay {
 						resources
 							.into_iter()
 							.filter(|r| {
-								policies.validate(
+								policies.validate_observed(
 									&rbac::ResourceType::Resource(rbac::ResourceId::new(
 										server_name.to_string(),
 										r.uri.to_string(),
@@ -1093,7 +1093,7 @@ impl Relay {
 						resource_templates
 							.into_iter()
 							.filter(|rt| {
-								policies.validate(
+								policies.validate_observed(
 									&rbac::ResourceType::Resource(rbac::ResourceId::new(
 										server_name.to_string(),
 										rt.uri_template.to_string(),

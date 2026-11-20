@@ -14,6 +14,7 @@ use crate::http::{self, Request, RequestBodyExt, Response};
 use crate::llm::router_callout::VirtualModelCalloutFailureMode;
 use crate::proxy::ProxyResponseReason;
 use crate::proxy::httpproxy::PolicyClient;
+use crate::telemetry::capability;
 use crate::types::agent::{
 	Authorization, BackendTrafficPolicy, HeaderMatch, RouteBackendReference,
 };
@@ -454,7 +455,11 @@ impl ModelRouter {
 			Ok(requested_model) => requested_model,
 			Err(resp) => return ResolveResult::Rejected(ProxyResponseReason::InvalidRequest, *resp),
 		};
-		if !api_key_model_authorized(req, &requested_model.model) {
+		if !api_key_model_authorized(
+			req,
+			&requested_model.model,
+			ModelDecision::Request(&requested_model.model),
+		) {
 			return ResolveResult::Error(Error::ApiKeyModelDenied(requested_model.model));
 		}
 		req
@@ -494,7 +499,7 @@ impl ModelRouter {
 			.models
 			.iter()
 			.filter(|model| model.visibility == ModelVisibility::Public)
-			.filter(|model| model_authorized(model, req))
+			.filter(|model| model_authorized(model, req, ModelDecision::Listing))
 			.flat_map(|model| {
 				if expand
 					&& let Some(discovery) = &model.discovery
@@ -508,7 +513,8 @@ impl ModelRouter {
 						.filter_map(|id| Some((id, discovery.transformation.apply(id)?)))
 						.filter(|(_, name)| {
 							// Now check it still matches the model match (e.g 'foo/*') and we are authorized for this model
-							model_name_matches(&model.name, name) && api_key_model_authorized(req, name)
+							model_name_matches(&model.name, name)
+								&& api_key_model_authorized(req, name, ModelDecision::Listing)
 						})
 						.map(|(id, name)| llm::model_list::ModelInfo {
 							preferred_endpoints: discovery.preferred_endpoints(id, &catalog),
@@ -530,7 +536,7 @@ impl ModelRouter {
 				self
 					.virtual_models
 					.iter()
-					.filter(|model| api_key_model_authorized(req, &model.name))
+					.filter(|model| api_key_model_authorized(req, &model.name, ModelDecision::Listing))
 					.map(|model| self.virtual_model_info(model, &catalog)),
 			)
 			.unique_by(|model| model.id.clone())
@@ -798,11 +804,9 @@ impl ModelRouter {
 				&& model_name_matches(&model.name, requested_model)
 				&& header_matches(&model.header_matches, req)
 		};
-		let Some(model) = self
-			.models
-			.iter()
-			.find(|model| matches(model) && model_authorized(model, req))
-		else {
+		let Some(model) = self.models.iter().find(|model| {
+			matches(model) && model_authorized(model, req, ModelDecision::Request(requested_model))
+		}) else {
 			return if self.models.iter().any(matches) {
 				Err(())
 			} else {
@@ -862,7 +866,36 @@ fn llm_error_response(status: ::http::StatusCode, message: &str, code: &str) -> 
 		.expect("LLM error response is valid")
 }
 
-fn model_authorized(model: &ModelRoute, req: &Request) -> bool {
+/// What a model-level authorization decision is about, which differs by where it is
+/// taken. Enumerating a listing asks about a configured route, whose name may be a
+/// pattern like `provider/*`; authorizing a request asks about the concrete model the
+/// caller named. Observing the pattern in the second case would put a glob in the
+/// capability catalog and give one request two identities.
+#[derive(Copy, Clone, Debug)]
+enum ModelDecision<'a> {
+	Listing,
+	Request(&'a str),
+}
+
+impl ModelDecision<'_> {
+	fn resource_id<'a>(&'a self, model: &'a ModelRoute) -> &'a str {
+		match self {
+			ModelDecision::Listing => model.name.as_str(),
+			ModelDecision::Request(requested) => requested,
+		}
+	}
+
+	fn decision_point(&self, api_key: bool) -> strng::Strng {
+		match (self, api_key) {
+			(ModelDecision::Listing, false) => strng::literal!("model listing"),
+			(ModelDecision::Request(_), false) => strng::literal!("model authorization"),
+			(ModelDecision::Listing, true) => strng::literal!("api key model listing"),
+			(ModelDecision::Request(_), true) => strng::literal!("api key model authorization"),
+		}
+	}
+}
+
+fn model_authorized(model: &ModelRoute, req: &Request, about: ModelDecision<'_>) -> bool {
 	let rules = model
 		.policies
 		.authorization
@@ -872,14 +905,44 @@ fn model_authorized(model: &ModelRoute, req: &Request) -> bool {
 	if rules.is_empty() {
 		return true;
 	}
-	crate::http::authorization::HTTPAuthorizationSet::new(
+	let authz = crate::http::authorization::HTTPAuthorizationSet::new(
 		crate::http::authorization::RuleSets::from_arcs(rules),
+	);
+	let Some(observer) = req
+		.extensions()
+		.get::<crate::telemetry::capability::CapabilityObserver>()
+	else {
+		return authz.evaluate(req, false).allowed;
+	};
+
+	let decision = authz.evaluate(req, observer.emits_records());
+	// A denied model is filtered out of the listing rather than reported, so this
+	// decision is invisible without an observation. No provider has been selected
+	// yet, which is why the resource carries the model name but no target.
+	let obs = capability::CapabilityObservation::new(
+		strng::literal!("llm:select_model"),
+		capability::Resource::new("llm.model", strng::EMPTY, about.resource_id(model)),
+		if decision.allowed {
+			capability::Outcome::Allow
+		} else {
+			capability::Outcome::Deny
+		},
+		decision.basis.into(),
+		about.decision_point(false),
 	)
-	.apply(req)
-	.is_ok()
+	.with_policy_refs(
+		decision
+			.rules
+			.iter()
+			.map(capability::PolicyRef::from)
+			.collect(),
+	)
+	.with_principal(capability::principal_from_extensions(req.extensions()));
+	observer.observe(&obs);
+	decision.allowed
 }
 
-fn api_key_model_authorized(req: &Request, model: &str) -> bool {
+fn api_key_model_authorized(req: &Request, model: &str, about: ModelDecision<'_>) -> bool {
 	let Some(policy) = req
 		.extensions()
 		.get::<crate::http::apikey::ModelAccessPolicy>()
@@ -890,6 +953,29 @@ fn api_key_model_authorized(req: &Request, model: &str) -> bool {
 	if !allowed {
 		tracing::debug!(model, "requested model is not allowed for API key");
 	}
+	let Some(observer) = req
+		.extensions()
+		.get::<crate::telemetry::capability::CapabilityObserver>()
+	else {
+		return allowed;
+	};
+
+	// A model withheld by the caller's API key is a second, independent denial from
+	// the route's own authorization, and it is just as invisible: the model is simply
+	// filtered away. No CEL rules back this decision, so it carries no policy refs.
+	let obs = capability::CapabilityObservation::new(
+		strng::literal!("llm:select_model"),
+		capability::Resource::new("llm.model", strng::EMPTY, model),
+		if allowed {
+			capability::Outcome::Allow
+		} else {
+			capability::Outcome::Deny
+		},
+		capability::AuthorizationBasis::ApiKey,
+		about.decision_point(true),
+	)
+	.with_principal(capability::principal_from_extensions(req.extensions()));
+	observer.observe(&obs);
 	allowed
 }
 
@@ -1940,6 +2026,212 @@ mod tests {
 		assert_eq!(body["error"]["code"], "virtual_model_target_not_found");
 	}
 
+	/// A model the caller may not use is filtered out of listings and selection, so the denial is
+	/// invisible unless it is observed. This is the same silent-filter shape as an MCP listing.
+	#[test]
+	fn denied_model_is_observed_rather_than_only_filtered() {
+		let authorization = Authorization(Arc::new(crate::http::authorization::RuleSet::new(
+			crate::http::authorization::PolicySet::new(
+				vec![Arc::new(
+					cel::Expression::new_strict("request.headers['x-model-access'] == 'allowed'".to_string())
+						.expect("valid CEL expression"),
+				)],
+				vec![],
+				vec![],
+			),
+		)));
+		let model = ModelRoute {
+			discovery: None,
+			id: None,
+			name: "gpt-5-mini".to_string(),
+			created: 0,
+			visibility: ModelVisibility::Public,
+			header_matches: vec![],
+			backend: RouteBackendReference {
+				weight: 1,
+				target: RouteBackendTarget::Invalid,
+				inline_policies: vec![],
+			},
+			policies: ModelRoutePolicies {
+				passthrough: None,
+				llm: Arc::default(),
+				authorization: Some(authorization),
+			},
+			backend_policies: vec![],
+		};
+
+		let mut prom = prometheus_client::registry::Registry::default();
+		let metrics = Arc::new(crate::telemetry::metrics::Metrics::new(
+			&mut prom,
+			frozen_collections::FzHashSet::default(),
+			Default::default(),
+		));
+		let mut denied = ::http::Request::builder()
+			.uri("http://example.com/v1/chat/completions")
+			.body(http::Body::empty())
+			.expect("valid request");
+		denied
+			.extensions_mut()
+			.insert(capability::CapabilityObserver::new(None, metrics, None));
+
+		assert!(
+			!model_authorized(&model, &denied, ModelDecision::Request("gpt-5-mini")),
+			"observing must not change the decision"
+		);
+
+		let mut encoded = String::new();
+		prometheus_client::encoding::text::encode(&mut encoded, &prom).unwrap();
+		let line = encoded
+			.lines()
+			.find(|l| l.starts_with("capability_observations_total{"))
+			.unwrap_or_else(|| panic!("no capability counter in:\n{encoded}"));
+		assert!(line.contains(r#"outcome="Deny""#), "{line}");
+		assert!(line.contains(r#"action="llm:select_model""#), "{line}");
+		assert!(line.contains(r#"resource_type="llm.model""#), "{line}");
+		assert!(
+			line.contains(r#"decision_point="model authorization""#),
+			"{line}"
+		);
+	}
+
+	/// A model can also be withheld by the caller's API key, independently of the route's
+	/// authorization policy. That denial filters the model away just as silently, so it is
+	/// observed with its own basis and decision point.
+	/// A route name can be a pattern like `provider/*`. Authorizing a request must observe the
+	/// concrete model the caller named, so that the route policy and the API key policy describe
+	/// the same capability, and so that a glob never becomes a capability id. Enumerating a
+	/// listing has no requested model and legitimately observes the configured name.
+	#[test]
+	fn request_decisions_observe_the_requested_model_not_the_route_pattern() {
+		let model = ModelRoute {
+			discovery: None,
+			id: None,
+			name: "gpt-5-*".to_string(),
+			created: 0,
+			visibility: ModelVisibility::Public,
+			header_matches: vec![],
+			backend: RouteBackendReference {
+				weight: 1,
+				target: RouteBackendTarget::Invalid,
+				inline_policies: vec![],
+			},
+			policies: ModelRoutePolicies {
+				passthrough: None,
+				llm: Arc::default(),
+				authorization: Some(Authorization(Arc::new(
+					crate::http::authorization::RuleSet::new(crate::http::authorization::PolicySet::new(
+						vec![Arc::new(
+							cel::Expression::new_strict("true".to_string()).expect("valid CEL expression"),
+						)],
+						vec![],
+						vec![],
+					)),
+				))),
+			},
+			backend_policies: vec![],
+		};
+
+		let observed = |about: ModelDecision<'_>| {
+			let mut prom = prometheus_client::registry::Registry::default();
+			let metrics = Arc::new(crate::telemetry::metrics::Metrics::new(
+				&mut prom,
+				frozen_collections::FzHashSet::default(),
+				Default::default(),
+			));
+			let mut req = ::http::Request::builder()
+				.body(http::Body::empty())
+				.expect("valid request");
+			req
+				.extensions_mut()
+				.insert(capability::CapabilityObserver::new(None, metrics, None));
+			assert!(model_authorized(&model, &req, about));
+			let mut encoded = String::new();
+			prometheus_client::encoding::text::encode(&mut encoded, &prom).unwrap();
+			encoded
+		};
+
+		// The resource id is the point of the change, and it reaches the log record only,
+		// so assert it directly rather than through the counter's labels.
+		assert_eq!(
+			ModelDecision::Request("gpt-5-mini").resource_id(&model),
+			"gpt-5-mini"
+		);
+		assert_eq!(ModelDecision::Listing.resource_id(&model), "gpt-5-*");
+
+		let request = observed(ModelDecision::Request("gpt-5-mini"));
+		assert!(
+			request.contains(r#"decision_point="model authorization""#),
+			"{request}"
+		);
+
+		let listing = observed(ModelDecision::Listing);
+		assert!(
+			listing.contains(r#"decision_point="model listing""#),
+			"{listing}"
+		);
+	}
+
+	#[test]
+	fn api_key_model_denial_is_observed() {
+		fn observed(allowed_models: Option<Vec<String>>, model: &str) -> (bool, String) {
+			let mut prom = prometheus_client::registry::Registry::default();
+			let metrics = Arc::new(crate::telemetry::metrics::Metrics::new(
+				&mut prom,
+				frozen_collections::FzHashSet::default(),
+				Default::default(),
+			));
+			let mut req = ::http::Request::builder()
+				.uri("http://example.com/v1/chat/completions")
+				.body(http::Body::empty())
+				.expect("valid request");
+			if let Some(allowed_models) = allowed_models {
+				req.extensions_mut().insert(
+					crate::http::apikey::ModelAccessPolicy::compile(Some(allowed_models))
+						.expect("valid allowedModels patterns"),
+				);
+			}
+			req
+				.extensions_mut()
+				.insert(capability::CapabilityObserver::new(None, metrics, None));
+
+			let allowed = api_key_model_authorized(&req, model, ModelDecision::Request(model));
+			let mut encoded = String::new();
+			prometheus_client::encoding::text::encode(&mut encoded, &prom).unwrap();
+			(allowed, encoded)
+		}
+
+		let (allowed, encoded) = observed(Some(vec!["other/model".to_string()]), "gpt-5-mini");
+		assert!(!allowed, "observing must not change the decision");
+		let line = encoded
+			.lines()
+			.find(|l| l.starts_with("capability_observations_total{"))
+			.unwrap_or_else(|| panic!("no capability counter in:\n{encoded}"));
+		assert!(line.contains(r#"outcome="Deny""#), "{line}");
+		assert!(line.contains(r#"action="llm:select_model""#), "{line}");
+		assert!(line.contains(r#"resource_type="llm.model""#), "{line}");
+		assert!(
+			line.contains(r#"decision_point="api key model authorization""#),
+			"{line}"
+		);
+
+		let (allowed, encoded) = observed(Some(vec!["gpt-5-*".to_string()]), "gpt-5-mini");
+		assert!(allowed, "the key permits this model");
+		let line = encoded
+			.lines()
+			.find(|l| l.starts_with("capability_observations_total{"))
+			.unwrap_or_else(|| panic!("no capability counter in:\n{encoded}"));
+		assert!(line.contains(r#"outcome="Allow""#), "{line}");
+
+		// No policy on the request means no API-key decision was taken, and inventing an
+		// allow here would report a decision that never happened.
+		let (allowed, encoded) = observed(None, "gpt-5-mini");
+		assert!(allowed, "an unrestricted key permits every model");
+		assert!(
+			!encoded.contains("capability_observations_total"),
+			"no decision was taken, so nothing may be observed:\n{encoded}"
+		);
+	}
+
 	#[test]
 	fn concrete_model_authorization_filters_requests() {
 		let authorization = Authorization(Arc::new(crate::http::authorization::RuleSet::new(
@@ -1982,8 +2274,16 @@ mod tests {
 			.body(http::Body::empty())
 			.expect("valid request");
 
-		assert!(model_authorized(&model, &allowed));
-		assert!(!model_authorized(&model, &denied));
+		assert!(model_authorized(
+			&model,
+			&allowed,
+			ModelDecision::Request("gpt-5-mini")
+		));
+		assert!(!model_authorized(
+			&model,
+			&denied,
+			ModelDecision::Request("gpt-5-mini")
+		));
 	}
 
 	#[test]

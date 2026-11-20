@@ -369,10 +369,15 @@ impl<T: RequestPolicyTrait> RequestPolicy<T> {
 			return Ok(None);
 		};
 
+		// Restore rather than clear, and restore on the error path too: a policy that
+		// applies another policy would otherwise blank the outer phase, and an
+		// early return would leave a stale one behind.
+		let outer_phase = log.policy_phase.replace(name);
 		let res = pol
 			.apply(client, log, req)
 			.await
 			.map(|r| r.apply(response_headers));
+		log.policy_phase = outer_phase;
 		dtrace::snapshot!(Request, name, &req);
 		// Return the policy, for response handling.
 		// Conditions are ignored; we already evaluated them on the request side
@@ -503,10 +508,16 @@ impl<T: BackendPolicyTrait> BackendPolicy<T> {
 			return Ok(ResponsePolicy::new(None));
 		};
 
+		let outer_phase = log
+			.as_deref_mut()
+			.and_then(|log| log.policy_phase.replace(name));
 		let res = pol
 			.apply(client, log, req)
 			.await
 			.map(|r| r.apply(response_headers));
+		if let Some(log) = log.as_deref_mut() {
+			log.policy_phase = outer_phase;
+		}
 		dtrace::snapshot!(Request, name, &req);
 		res.map(|_| ResponsePolicy::new(Some(pol.clone())))
 	}

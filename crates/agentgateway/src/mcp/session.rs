@@ -213,7 +213,7 @@ impl Session {
 		log.non_atomic_mutate(|l| {
 			l.set_prompt(service_name.to_string(), prompt.to_string());
 		});
-		if !self.relay.policies.validate(
+		if !self.relay.policies.validate_observed(
 			&rbac::ResourceType::Prompt(rbac::ResourceId::new(
 				service_name.to_string(),
 				prompt.to_string(),
@@ -240,7 +240,7 @@ impl Session {
 		log.non_atomic_mutate(|l| {
 			l.set_resource(service_name.to_string(), uri.to_string());
 		});
-		if !self.relay.policies.validate(
+		if !self.relay.policies.validate_observed(
 			&rbac::ResourceType::Resource(rbac::ResourceId::new(
 				service_name.to_string(),
 				uri.to_string(),
@@ -268,7 +268,7 @@ impl Session {
 		log.non_atomic_mutate(|l| {
 			l.set_task(service_name.to_string(), task_id.to_string());
 		});
-		if !self.relay.policies.validate(
+		if !self.relay.policies.validate_observed(
 			&rbac::ResourceType::Task(rbac::ResourceId::new(
 				service_name.to_string(),
 				task_id.to_string(),
@@ -310,7 +310,7 @@ impl Session {
 			.maybe_run_guardrails_call_request(backend, method, params, extensions, ctx)
 			.await?;
 		let cel = rbac::CelExecWrapper::from(ctx.clone());
-		if self.relay.policies.validate(&res, method, &cel) {
+		if self.relay.policies.validate_observed(&res, method, &cel) {
 			Ok(())
 		} else {
 			Err(UpstreamError::Authorization {

@@ -143,6 +143,10 @@ impl App {
 		req.extensions_mut().insert(logy);
 		req.extensions_mut().insert(log.mcp_guardrails.clone());
 
+		if let Some(observer) = crate::telemetry::capability::CapabilityObserver::from_log(log) {
+			req.extensions_mut().insert(observer);
+		}
+
 		if backend.dns_rebinding_protection
 			&& let Some(resp) = mcp::dns_rebinding::reject_non_localhost(&req)
 		{

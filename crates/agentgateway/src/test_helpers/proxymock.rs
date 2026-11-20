@@ -426,6 +426,10 @@ pub struct TestBind {
 	pub pi: Arc<ProxyInputs>,
 	drain_rx: DrainWatcher,
 	_drain_tx: DrainTrigger,
+	// The registry backing `pi.metrics`, kept alive so tests can scrape what the
+	// proxy recorded; `Metrics::new` only needs `&mut Registry` during
+	// construction, so this is populated after that call returns.
+	metrics_registry: Arc<Registry>,
 
 	// Counters to help make unique items
 	routes: usize,
@@ -483,6 +487,13 @@ impl tower::Service<Uri> for MemoryConnector {
 }
 
 impl TestBind {
+	/// Prometheus text exposition of everything this proxy has recorded.
+	pub fn metrics_text(&self) -> String {
+		let mut out = String::new();
+		prometheus_client::encoding::text::encode(&mut out, &self.metrics_registry).unwrap();
+		out
+	}
+
 	pub fn with_bind(self, snapshot: BindSnapshot) -> Self {
 		let mut binds = self.pi.stores.binds.write();
 		let bind_key = snapshot.key.clone();
@@ -1517,14 +1528,20 @@ pub fn setup_proxy_test_with_config_and_spiffe(
 	let stores = Stores::new(config.ipv6_enabled, config.threading_mode);
 	let client = client::Client::new(&config.dns, None, config.backend.clone(), None);
 	let (drain_tx, drain_rx) = drain::new();
+	// `sub_registry` mutably borrows `registry` only for the duration of
+	// `Metrics::new`; once construction is done we move `registry` into an
+	// `Arc` so tests can scrape it via `TestBind::metrics_text`.
+	let mut registry = Registry::default();
+	let proxy_metrics = crate::metrics::Metrics::new(
+		metrics::sub_registry(&mut registry),
+		Default::default(),
+		histogram_mode,
+	);
+	let metrics_registry = Arc::new(registry);
 	let pi = Arc::new(ProxyInputs {
 		cfg: Arc::new(config),
 		stores: stores.clone(),
-		metrics: Arc::new(crate::metrics::Metrics::new(
-			metrics::sub_registry(&mut Registry::default()),
-			Default::default(),
-			histogram_mode,
-		)),
+		metrics: Arc::new(proxy_metrics),
 		model_catalog: catalog::ModelCatalog::empty(),
 		admin: None,
 		stats: None,
@@ -1539,6 +1556,7 @@ pub fn setup_proxy_test_with_config_and_spiffe(
 		pi,
 		drain_rx,
 		_drain_tx: drain_tx,
+		metrics_registry,
 
 		routes: 0,
 		policies: 0,

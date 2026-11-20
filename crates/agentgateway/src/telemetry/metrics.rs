@@ -330,6 +330,10 @@ pub struct Metrics {
 	// metrics for guardrail checks (allow/mask/reject) for request/response
 	pub guardrail_checks: Family<GuardrailLabels, counter::Counter>,
 
+	// metrics for capability observability (bounded cardinality labels only)
+	pub capability_observations:
+		Family<crate::telemetry::capability::ObservationLabels, counter::Counter>,
+
 	pub cost_catalog_lookups: Family<CostCatalogLookupLabels, counter::Counter>,
 
 	// metrics for request retries
@@ -493,6 +497,15 @@ impl Metrics {
 				registry.register(
 					"guardrail_checks",
 					"Total number of guardrail checks",
+					m.clone(),
+				);
+				m
+			},
+			capability_observations: {
+				let m = Family::<crate::telemetry::capability::ObservationLabels, _>::default();
+				registry.register(
+					"capability_observations",
+					"Total number of capability observations",
 					m.clone(),
 				);
 				m

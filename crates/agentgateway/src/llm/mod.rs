@@ -27,6 +27,7 @@ use crate::http::jwt::Claims;
 use crate::http::{Body, Request, Response};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::store::{BackendPolicies, LLMResponsePolicies};
+use crate::telemetry::capability::CapabilityObserver;
 use crate::telemetry::log::{AsyncLog, GuardrailLog, RequestLog};
 use crate::types::agent::{BackendTrafficPolicy, SimpleBackendReference, Target};
 use crate::types::loadbalancer::{ActiveHandle, EndpointWithInfo};
@@ -44,6 +45,7 @@ pub mod catalog;
 pub mod discovery;
 pub mod policy;
 
+use policy::GuardObserver;
 use policy::streaming_guardrails::GuardedSseBody;
 pub use types::{OutputMessage, OutputMessagePart, ToolCall};
 
@@ -355,6 +357,7 @@ pub struct LLMLogging {
 	pub response: AsyncLog<LLMInfo>,
 	pub guardrails: GuardrailLog,
 	pub content: LogContentFields,
+	pub observer: Option<CapabilityObserver>,
 }
 
 // Context provider to each response translation (streaming)
@@ -2485,6 +2488,15 @@ impl AIProvider {
 				let claims = parts.extensions.get::<Claims>().cloned();
 				let original = log.as_ref().and_then(|l| l.request_snapshot.clone());
 				let guardrail_log = log.as_ref().map(|l| l.guardrails.clone());
+				let observer = log
+					.as_deref()
+					.and_then(CapabilityObserver::from_log)
+					// Read the model inside the map: the feature is off by default, and this
+					// runs on every prompt-guarded request.
+					.map(|o| {
+						let model = strng::new(req.model().as_deref().unwrap_or_default());
+						GuardObserver::new(o, original_format, self.provider(), model)
+					});
 				if let Some((response, guardrail)) = p
 					.apply_prompt_guard(
 						&client,
@@ -2493,6 +2505,7 @@ impl AIProvider {
 						claims,
 						original.as_deref(),
 						guardrail_log.as_ref(),
+						observer.as_ref(),
 					)
 					.await
 					.map_err(|e| {
@@ -2846,7 +2859,16 @@ impl AIProvider {
 			response: log,
 			guardrails: guardrail_log,
 			content: log_content,
+			observer,
 		} = logging;
+		let observer = observer.map(|o| {
+			GuardObserver::new(
+				o,
+				req.input_format,
+				req.provider.clone(),
+				req.request_model.clone(),
+			)
+		});
 		let BufferedResponse {
 			mut parts,
 			bytes,
@@ -2879,6 +2901,7 @@ impl AIProvider {
 					&rate_limit.prompt_guard,
 					req_snapshot.as_deref(),
 					Some(&guardrail_log),
+					observer.as_ref(),
 				)
 				.await
 				.map_err(|e| {
@@ -3283,9 +3306,12 @@ impl AIProvider {
 			response: log,
 			guardrails: guardrail_log,
 			content: log_content,
+			observer,
 		} = logging;
 		let model = req.request_model.clone();
 		let input_format = req.input_format;
+		let observer =
+			observer.map(|o| GuardObserver::new(o, input_format, req.provider.clone(), model.clone()));
 		let bedrock_tool_name_map = bedrock_tool_name_map(&req).cloned();
 		let namespaces = namespace_tool_map(&req).cloned();
 		let chat_translation = if input_format.is_chat() {
@@ -3363,6 +3389,7 @@ impl AIProvider {
 				&prompt_guard_headers,
 				req_snapshot.clone(),
 				guardrail_log,
+				observer.clone(),
 			)
 		} else {
 			vec![]

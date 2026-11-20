@@ -1319,6 +1319,13 @@
               "type": "null"
             }
           ]
+        },
+        "capabilityObservations": {
+          "description": "Emit a capability observation at each authorization decision, describing the action and resource that was evaluated. Always increments `agentgateway_capability_observations_total`; the full log record additionally requires an OTLP access log backend on the listener. Off by default: this adds one record per decision, and MCP listings evaluate every advertised tool, prompt, and resource individually.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "additionalProperties": false

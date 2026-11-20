@@ -262,7 +262,7 @@ pub enum AuthorizationResult {
 	Deny,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub enum AuthorizationRuleMode {
 	Allow,
@@ -270,7 +270,7 @@ pub enum AuthorizationRuleMode {
 	Require,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[allow(non_snake_case)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizationRuleResult {

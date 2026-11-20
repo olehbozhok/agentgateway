@@ -7,7 +7,11 @@ use serde::Serialize;
 use vector_map::VecMap;
 
 use crate::cel::ContextBuilder;
-use crate::http::authorization::{RuleSet, RuleSets};
+use crate::http::authorization::{AuthorizationDecision, DecisionBasis, RuleSet, RuleSets};
+use crate::telemetry::capability::{
+	CapabilityObservation, CapabilityObserver, Outcome, PolicyRef, Resource,
+	principal_from_extensions,
+};
 use crate::*;
 
 #[apply(schema!)]
@@ -51,15 +55,73 @@ impl McpAuthorizationSet {
 	}
 
 	pub fn validate(&self, res: &ResourceType, method_name: &Strng, cel: &CelExecWrapper) -> bool {
+		self.evaluate(res, method_name, cel, false).allowed
+	}
+
+	fn evaluate(
+		&self,
+		res: &ResourceType,
+		method_name: &Strng,
+		cel: &CelExecWrapper,
+		with_rules: bool,
+	) -> AuthorizationDecision {
 		if !self.0.has_rules() {
-			return true;
+			return AuthorizationDecision {
+				allowed: true,
+				rules: Vec::new(),
+				basis: DecisionBasis::Default,
+			};
 		}
 		tracing::debug!("Checking RBAC for resource: {:?}", res);
 		let mut mcp = crate::mcp::MCPInfo::from(res);
 		mcp.method_name = Some(method_name.clone());
 		let mut exec = cel.0.executor();
 		exec.mcp = Some(crate::mcp::MCPView::new(&mcp));
-		self.0.validate(&exec)
+		self.0.evaluate_with_rules(&exec, with_rules)
+	}
+
+	/// Like [`Self::validate`], but also emits a capability observation when an
+	/// OTLP logger is available via the request extensions (threaded there by
+	/// `mcp::router` using `CapabilityObserver`).
+	pub fn validate_observed(
+		&self,
+		res: &ResourceType,
+		method_name: &Strng,
+		cel: &CelExecWrapper,
+	) -> bool {
+		let Some(observer) = cel.0.extensions().get::<CapabilityObserver>() else {
+			return self.evaluate(res, method_name, cel, false).allowed;
+		};
+		// The rule list is only read back by the log record, and a listing evaluates
+		// this once per advertised tool, prompt and resource, so skip the
+		// non-short-circuiting pass when nothing will carry it.
+		let decision = self.evaluate(res, method_name, cel, observer.emits_records());
+
+		let (resource_type, target, id) = match res {
+			ResourceType::Tool(r) => ("mcp.tool", r.target(), r.name()),
+			ResourceType::Prompt(r) => ("mcp.prompt", r.target(), r.name()),
+			ResourceType::Resource(r) => ("mcp.resource", r.target(), r.name()),
+			ResourceType::Task(r) => ("mcp.task", r.target(), r.name()),
+		};
+		let resource = Resource::new(resource_type, target, id);
+		let outcome = if decision.allowed {
+			Outcome::Allow
+		} else {
+			Outcome::Deny
+		};
+		let policy_refs = decision.rules.iter().map(PolicyRef::from).collect();
+		let principal = principal_from_extensions(cel.0.extensions());
+		let obs = CapabilityObservation::new(
+			method_name.clone(),
+			resource,
+			outcome,
+			decision.basis.into(),
+			strng::literal!("mcp authorization"),
+		)
+		.with_policy_refs(policy_refs)
+		.with_principal(principal);
+		observer.observe(&obs);
+		decision.allowed
 	}
 
 	pub fn register(&self, cel: &mut ContextBuilder) {
@@ -270,5 +332,80 @@ mod tests {
 
 		assert!(authz.validate(&res, &TOOLS_LIST, &cel));
 		assert!(!authz.validate(&res, &TOOLS_CALL, &cel));
+	}
+
+	/// Builds an observer over a fresh, unprefixed local registry so the
+	/// counter series can be scraped without pulling in the full proxy metrics
+	/// stack. Mirrors the pattern in `telemetry::capability::tests` and
+	/// `llm::policy::tests`.
+	fn observer_over_registry() -> (
+		prometheus_client::registry::Registry,
+		crate::telemetry::capability::CapabilityObserver,
+	) {
+		let mut prom = prometheus_client::registry::Registry::default();
+		let metrics = Arc::new(crate::telemetry::metrics::Metrics::new(
+			&mut prom,
+			frozen_collections::FzHashSet::default(),
+			Default::default(),
+		));
+		let observer = crate::telemetry::capability::CapabilityObserver::new(None, metrics, None);
+		(prom, observer)
+	}
+
+	fn scrape_capability_line(prom: &prometheus_client::registry::Registry) -> String {
+		let mut encoded = String::new();
+		prometheus_client::encoding::text::encode(&mut encoded, prom).unwrap();
+		encoded
+			.lines()
+			.find(|l| l.starts_with("capability_observations_total{"))
+			.unwrap_or_else(|| panic!("no capability counter in:\n{encoded}"))
+			.to_string()
+	}
+
+	#[test]
+	fn test_validate_observed_denied_tool_is_counted_and_still_denied() {
+		// The allow rule keys on a claim the request never carries, so the
+		// decision is deny; per `CapabilityObserver` docs, observing must never
+		// change that outcome.
+		let authz = authorization_set(r#"mcp.tool.name == "increment" && jwt.sub == "1234567890""#);
+		let res = tool_resource("ServerOne", "increment");
+
+		let (prom, observer) = observer_over_registry();
+		let mut req = req_without_claims();
+		req.extensions_mut().insert(observer);
+		let cel = cel_context(req);
+
+		let allowed = authz.validate_observed(&res, &TOOLS_CALL, &cel);
+		assert!(!allowed, "observing must not change the deny decision");
+
+		let line = scrape_capability_line(&prom);
+		assert!(line.contains(r#"outcome="Deny""#), "{line}");
+		assert!(line.contains(r#"action="tools/call""#), "{line}");
+		assert!(line.contains(r#"resource_type="mcp.tool""#), "{line}");
+		assert!(line.contains(r#"resource_target="ServerOne""#), "{line}");
+		// resource_id and principal are log-only, never metric labels.
+		assert!(!line.contains("increment"), "resource id leaked: {line}");
+		assert!(!line.contains("1234567890"), "principal leaked: {line}");
+	}
+
+	#[test]
+	fn test_validate_observed_allowed_tool_is_counted_as_allow() {
+		let authz = authorization_set(r#"mcp.tool.name == "increment""#);
+		let res = tool_resource("ServerOne", "increment");
+
+		let (prom, observer) = observer_over_registry();
+		let mut req = req_without_claims();
+		req.extensions_mut().insert(observer);
+		let cel = cel_context(req);
+
+		let allowed = authz.validate_observed(&res, &TOOLS_CALL, &cel);
+		assert!(allowed, "observing must not change the allow decision");
+
+		let line = scrape_capability_line(&prom);
+		assert!(line.contains(r#"outcome="Allow""#), "{line}");
+		assert!(line.contains(r#"action="tools/call""#), "{line}");
+		assert!(line.contains(r#"resource_type="mcp.tool""#), "{line}");
+		assert!(line.contains(r#"resource_target="ServerOne""#), "{line}");
+		assert!(!line.contains("increment"), "resource id leaked: {line}");
 	}
 }

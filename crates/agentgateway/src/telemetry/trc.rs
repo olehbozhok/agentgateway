@@ -880,6 +880,7 @@ mod tests {
 
 	fn test_request_log() -> RequestLog {
 		let cel = CelLogging {
+			capability_observations: false,
 			cel_context: crate::cel::ContextBuilder::new(),
 			filter: None,
 			fields: LoggingFields::default(),

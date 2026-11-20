@@ -7,10 +7,32 @@ use crate::proxy::dtrace::{
 	self, AuthorizationResult as TraceAuthorizationResult, AuthorizationRuleMode,
 	AuthorizationRuleResult,
 };
+use crate::telemetry::capability::{
+	CapabilityObservation, CapabilityObserver, Outcome, PolicyRef, Resource,
+	principal_from_extensions,
+};
+use crate::telemetry::log::RequestLog;
 use crate::*;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct HTTPAuthorizationSet(RuleSets);
+
+/// Lowercase HTTP method as a capability action. The standard methods are a
+/// closed set, so only an extension method has to allocate.
+fn method_action(method: &::http::Method) -> Strng {
+	match *method {
+		::http::Method::GET => strng::literal!("get"),
+		::http::Method::POST => strng::literal!("post"),
+		::http::Method::PUT => strng::literal!("put"),
+		::http::Method::DELETE => strng::literal!("delete"),
+		::http::Method::PATCH => strng::literal!("patch"),
+		::http::Method::HEAD => strng::literal!("head"),
+		::http::Method::OPTIONS => strng::literal!("options"),
+		::http::Method::CONNECT => strng::literal!("connect"),
+		::http::Method::TRACE => strng::literal!("trace"),
+		_ => strng::new(method.as_str().to_ascii_lowercase()),
+	}
+}
 
 impl HTTPAuthorizationSet {
 	pub fn new(rs: RuleSets) -> Self {
@@ -22,14 +44,60 @@ impl HTTPAuthorizationSet {
 	pub fn expressions(&self) -> impl Iterator<Item = &cel::Expression> {
 		self.0.expressions()
 	}
-	pub fn apply(&self, req: &http::Request) -> anyhow::Result<()> {
+	/// Evaluate this policy set against `req`. `with_rules` asks for the diagnostic
+	/// rule list, which costs a second, non-short-circuiting pass.
+	pub fn evaluate(&self, req: &http::Request, with_rules: bool) -> AuthorizationDecision {
 		tracing::debug!(info=?http::DebugExtensions(req), "Checking HTTP request");
 		let exec = cel::Executor::new_request(req);
-		let allowed = self.0.validate(&exec);
-		if !allowed {
-			anyhow::bail!("HTTP authorization denied");
-		}
-		Ok(())
+		self.0.evaluate_with_rules(&exec, with_rules)
+	}
+
+	fn observe_decision(
+		&self,
+		observer: &CapabilityObserver,
+		log: &RequestLog,
+		req: &http::Request,
+		decision: &AuthorizationDecision,
+	) {
+		let policy_refs = decision.rules.iter().map(PolicyRef::from).collect();
+
+		// Both authorization phases run request-side, where `LLMContext` is not yet
+		// populated (it is attached to the response), so the capability is always
+		// described in HTTP terms here. LLM capabilities are observed by the
+		// guardrail path in `llm::policy`.
+		//
+		// The action is the bare HTTP method so it stays safe as a metric label; the
+		// path is carried as the resource id, which is log-only.
+		let action = method_action(req.method());
+		// The listener, not the route: the route is not selected yet at gateway scope,
+		// so keying on it gave the same request two ids depending on which
+		// authorization point decided. A route name is also config that can be renamed
+		// or split without the capability changing, which the id must survive.
+		// Qualified: a listener name is local to its gateway, and unnamed listeners
+		// default to `listener{index}`, so the bare name collides across gateways.
+		let target = log
+			.listener_name
+			.as_ref()
+			.map(|l| strng::format!("{}/{}", l.as_gateway_name(), l.listener_name))
+			.unwrap_or_default();
+		let resource = Resource::new("http.path", target, req.uri().path());
+
+		let outcome = if decision.allowed {
+			Outcome::Allow
+		} else {
+			Outcome::Deny
+		};
+		let principal = principal_from_extensions(req.extensions());
+		let obs = CapabilityObservation::new(
+			action,
+			resource,
+			outcome,
+			decision.basis.into(),
+			log.policy_phase.unwrap_or("http authorization"),
+		)
+		.with_policy_refs(policy_refs)
+		.with_principal(principal);
+		observer.observe(&obs);
 	}
 }
 
@@ -37,12 +105,23 @@ impl crate::store::RequestPolicyTrait for HTTPAuthorizationSet {
 	async fn apply(
 		&self,
 		_client: &crate::proxy::httpproxy::PolicyClient,
-		_log: &mut crate::telemetry::log::RequestLog,
+		log: &mut crate::telemetry::log::RequestLog,
 		req: &mut http::Request,
 	) -> Result<http::PolicyResponse, ProxyError> {
-		self
-			.apply(req)
-			.map_err(|_| ProxyError::AuthorizationFailed)?;
+		tracing::debug!(info=?http::DebugExtensions(req), "Checking HTTP request");
+		let exec = cel::Executor::new_request(req);
+		// The observer is the single gate: the diagnostic re-evaluation is only
+		// worth its cost when a capability log record will actually carry it.
+		let observer = CapabilityObserver::from_log(log);
+		let decision = self
+			.0
+			.evaluate_with_rules(&exec, observer.as_ref().is_some_and(|o| o.emits_records()));
+		if let Some(observer) = &observer {
+			self.observe_decision(observer, log, req, &decision);
+		}
+		if !decision.allowed {
+			return Err(ProxyError::AuthorizationFailed);
+		}
 		Ok(http::PolicyResponse::default())
 	}
 
@@ -55,12 +134,21 @@ impl crate::store::BackendPolicyTrait for HTTPAuthorizationSet {
 	async fn apply(
 		&self,
 		_client: &crate::proxy::httpproxy::PolicyClient,
-		_log: &mut Option<&mut crate::telemetry::log::RequestLog>,
+		log: &mut Option<&mut crate::telemetry::log::RequestLog>,
 		req: &mut http::Request,
 	) -> Result<http::PolicyResponse, ProxyError> {
-		self
-			.apply(req)
-			.map_err(|_| ProxyError::AuthorizationFailed)?;
+		tracing::debug!(info=?http::DebugExtensions(req), "Checking HTTP request");
+		let exec = cel::Executor::new_request(req);
+		let observer = log.as_deref().and_then(CapabilityObserver::from_log);
+		let decision = self
+			.0
+			.evaluate_with_rules(&exec, observer.as_ref().is_some_and(|o| o.emits_records()));
+		if let (Some(observer), Some(log)) = (&observer, log.as_deref()) {
+			self.observe_decision(observer, log, req, &decision);
+		}
+		if !decision.allowed {
+			return Err(ProxyError::AuthorizationFailed);
+		}
 		Ok(http::PolicyResponse::default())
 	}
 
@@ -252,6 +340,9 @@ impl RuleSets {
 		self.0.iter().any(|r| r.has_rules())
 	}
 	pub fn validate(&self, exec: &Executor) -> bool {
+		self.evaluate_with_rules(exec, false).allowed
+	}
+	pub fn evaluate_with_rules(&self, exec: &Executor, with_rules: bool) -> AuthorizationDecision {
 		let rule_sets = &self.0;
 		let has_rules = self.has_rules();
 		// If there are no rule sets, everyone has access
@@ -273,10 +364,13 @@ impl RuleSets {
 			!rule_sets.iter().any(|r| r.has_allow_rules())
 		};
 
-		dtrace::trace(|trace| {
-			// Re-evaluate the rules for diagnostics. Note we do not short-circuit here.
-			let mut rules = Vec::new();
+		// Re-evaluate the rules for diagnostics. Note we do not short-circuit here.
+		// Only pay the double-evaluation cost when an observation needs `rules`
+		// or a dtrace watcher is active; otherwise preserve the original
+		// short-circuit behavior.
+		let mut rules = Vec::new();
 
+		if with_rules || dtrace::is_active() {
 			for rule_set in rule_sets {
 				for rule in &rule_set.rules.allow {
 					rules.push(AuthorizationRuleResult {
@@ -300,9 +394,11 @@ impl RuleSets {
 					});
 				}
 			}
+		}
 
+		dtrace::trace(|trace| {
 			trace.authorization_result(
-				rules,
+				rules.clone(),
 				if allowed {
 					TraceAuthorizationResult::Allow
 				} else {
@@ -311,12 +407,37 @@ impl RuleSets {
 			)
 		});
 
-		allowed
+		AuthorizationDecision {
+			allowed,
+			basis: if has_rules {
+				DecisionBasis::CelPolicy
+			} else {
+				DecisionBasis::Default
+			},
+			rules,
+		}
 	}
 
 	pub fn is_empty(&self) -> bool {
 		self.0.is_empty()
 	}
+}
+
+/// The result of evaluating an authorization policy set for a request.
+#[derive(Debug)]
+pub struct AuthorizationDecision {
+	pub allowed: bool,
+	pub rules: Vec<dtrace::AuthorizationRuleResult>,
+	pub basis: DecisionBasis,
+}
+
+/// Why an authorization decision came out the way it did.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DecisionBasis {
+	/// A CEL policy set produced the decision.
+	CelPolicy,
+	/// No policies were configured, so the default outcome applied.
+	Default,
 }
 
 impl RuleSet {
@@ -367,3 +488,66 @@ impl RuleSet {
 #[cfg(any(test, feature = "internal_benches"))]
 #[path = "authorization_tests.rs"]
 mod tests;
+
+// A separate module from `authorization_tests.rs` (which is mounted as `tests`).
+#[cfg(test)]
+mod evaluate_with_rules_tests {
+	use super::*;
+
+	fn expr(e: &str) -> Arc<cel::Expression> {
+		Arc::new(cel::Expression::new_strict(e).unwrap())
+	}
+
+	const ALLOW_GET: &str = r#"request.method == "GET""#;
+	const DENY_POST: &str = r#"request.method == "POST""#;
+
+	fn rule_sets() -> RuleSets {
+		RuleSets::from(vec![RuleSet::new(PolicySet::new(
+			vec![expr(ALLOW_GET)],
+			vec![expr(DENY_POST)],
+			vec![],
+		))])
+	}
+
+	fn request() -> http::Request {
+		::http::Request::builder()
+			.method(::http::Method::GET)
+			.uri("http://example.com/things")
+			.body(http::Body::empty())
+			.unwrap()
+	}
+
+	#[test]
+	fn rules_are_not_evaluated_when_nothing_consumes_them() {
+		let req = request();
+		let exec = cel::Executor::new_request(&req);
+		let decision = rule_sets().evaluate_with_rules(&exec, false);
+		assert!(decision.allowed);
+		// An empty vector is the observable proof that the non-short-circuiting
+		// second pass was skipped.
+		assert!(decision.rules.is_empty());
+	}
+
+	#[test]
+	fn rules_report_every_policy_when_requested() {
+		let req = request();
+		let exec = cel::Executor::new_request(&req);
+		let decision = rule_sets().evaluate_with_rules(&exec, true);
+		assert!(decision.allowed);
+		assert_eq!(decision.rules.len(), 2);
+
+		assert_eq!(decision.rules[0].name, ALLOW_GET);
+		assert!(matches!(
+			decision.rules[0].mode,
+			AuthorizationRuleMode::Allow
+		));
+		assert!(decision.rules[0].matched);
+
+		assert_eq!(decision.rules[1].name, DENY_POST);
+		assert!(matches!(
+			decision.rules[1].mode,
+			AuthorizationRuleMode::Deny
+		));
+		assert!(!decision.rules[1].matched);
+	}
+}

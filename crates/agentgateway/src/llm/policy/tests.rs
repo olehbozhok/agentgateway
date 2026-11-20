@@ -32,7 +32,7 @@ async fn webhook_fail_open_emits_single_metric() {
 	let client = crate::test_helpers::policy_client();
 	let log = GuardrailLog::default();
 	let blocked = guard
-		.apply_realtime_request_guards("hello world", &client, None, Some(&log))
+		.apply_realtime_request_guards("hello world", &client, None, Some(&log), None)
 		.await;
 	assert!(blocked.is_none(), "FailOpen must not block the request");
 	let entry = &log.take().unwrap()[0];
@@ -95,10 +95,11 @@ async fn audit_mode_records_allow_when_nothing_matches() {
 		content: "nothing sensitive here".to_string(),
 	};
 	let headers = ::http::HeaderMap::new();
-	let (action, rejection) =
-		Policy::apply_single_response_guard(&guard, &mut resp, &headers, &client, None, None, true)
-			.await
-			.unwrap();
+	let (action, rejection) = Policy::apply_single_response_guard(
+		&guard, &mut resp, &headers, &client, None, None, true, None,
+	)
+	.await
+	.unwrap();
 	assert!(rejection.is_none(), "audit mode must never reject");
 	Policy::record_guardrail_trip(&client, GuardrailPhase::Response, action);
 
@@ -132,10 +133,11 @@ async fn audit_mode_records_audit_and_passes_through_on_match() {
 		content: original.clone(),
 	};
 	let headers = ::http::HeaderMap::new();
-	let (action, rejection) =
-		Policy::apply_single_response_guard(&guard, &mut resp, &headers, &client, None, None, true)
-			.await
-			.unwrap();
+	let (action, rejection) = Policy::apply_single_response_guard(
+		&guard, &mut resp, &headers, &client, None, None, true, None,
+	)
+	.await
+	.unwrap();
 	assert_eq!(
 		action,
 		GuardrailAction::Audit,
@@ -216,7 +218,14 @@ async fn streaming_guard_records_one_metric_per_stream() {
 	};
 	let client = crate::test_helpers::policy_client();
 	let headers = ::http::HeaderMap::new();
-	let mut evaluator = make_evaluator(&guard, client.clone(), headers, None, Default::default());
+	let mut evaluator = make_evaluator(
+		&guard,
+		client.clone(),
+		headers,
+		None,
+		Default::default(),
+		None,
+	);
 
 	let _ = evaluator.evaluate("clean window one").await.unwrap();
 	let _ = evaluator.evaluate("this window has SECRET").await.unwrap();
@@ -237,6 +246,308 @@ async fn streaming_guard_records_one_metric_per_stream() {
 		guardrail_metric(&client, GuardrailPhase::Response, GuardrailAction::Allow),
 		0,
 		"the matching window's Audit outranks the benign windows' Allow"
+	);
+}
+
+/// The streaming path evaluates one window at a time; the capability observation must be folded
+/// into a single record for the stream, exactly like the guardrail metric above.
+#[tokio::test]
+async fn streaming_guard_records_one_capability_observation_per_stream() {
+	use crate::llm::policy::streaming_guardrails::make_evaluator;
+
+	// Sums every `capability_observations_total` series, so a fold that emits the
+	// right number of series with the wrong count still fails.
+	fn observation_count(prom: &prometheus_client::registry::Registry) -> u64 {
+		let mut encoded = String::new();
+		prometheus_client::encoding::text::encode(&mut encoded, prom).unwrap();
+		encoded
+			.lines()
+			.filter(|l| l.starts_with("capability_observations_total{"))
+			.map(|l| {
+				l.rsplit_once("} ")
+					.expect("counter line has a value")
+					.1
+					.parse::<u64>()
+					.expect("counter value is an integer")
+			})
+			.sum()
+	}
+
+	fn encoded(prom: &prometheus_client::registry::Registry) -> String {
+		let mut out = String::new();
+		prometheus_client::encoding::text::encode(&mut out, prom).unwrap();
+		out
+	}
+
+	let guard = ResponseGuard {
+		rejection: Default::default(),
+		scope: default_response_scope(),
+		kind: ResponseGuardKind::Regex(RegexRules {
+			action: Action::Audit,
+			rules: vec![RegexRule::Regex {
+				pattern: regex::Regex::new("SECRET").unwrap(),
+			}],
+		}),
+	};
+	let client = crate::test_helpers::policy_client();
+	let headers = ::http::HeaderMap::new();
+
+	let mut prom = prometheus_client::registry::Registry::default();
+	let metrics = std::sync::Arc::new(crate::telemetry::metrics::Metrics::new(
+		&mut prom,
+		frozen_collections::FzHashSet::default(),
+		Default::default(),
+	));
+	let observer = crate::telemetry::capability::CapabilityObserver::new(None, metrics, None);
+	let observer = GuardObserver::new(
+		observer,
+		InputFormat::Messages,
+		strng::literal!("openai"),
+		strng::literal!("gpt-4o"),
+	);
+
+	let mut evaluator = make_evaluator(
+		&guard,
+		client.clone(),
+		headers,
+		None,
+		Default::default(),
+		Some(observer),
+	);
+
+	let _ = evaluator.evaluate("clean window one").await.unwrap();
+	let _ = evaluator.evaluate("this window has SECRET").await.unwrap();
+	let _ = evaluator.evaluate("clean window three").await.unwrap();
+	assert_eq!(
+		observation_count(&prom),
+		0,
+		"no capability observation recorded mid-stream, got:\n{}",
+		encoded(&prom)
+	);
+
+	drop(evaluator);
+	assert_eq!(
+		observation_count(&prom),
+		1,
+		"exactly one capability observation for the whole stream, not one per window, got:\n{}",
+		encoded(&prom)
+	);
+}
+
+/// The provider and model must come from the typed request, not from the request snapshot:
+/// `LLMContext` is attached to the response while the snapshot reads the request, and the snapshot
+/// only exists when a CEL expression asked for one. Reading it there left every LLM observation
+/// with an empty provider and model, so they all shared one capability id.
+#[tokio::test]
+async fn streaming_guard_observation_names_the_provider_and_model() {
+	use crate::llm::policy::streaming_guardrails::make_evaluator;
+
+	let guard = ResponseGuard {
+		rejection: Default::default(),
+		scope: default_response_scope(),
+		kind: ResponseGuardKind::Regex(RegexRules {
+			action: Action::Audit,
+			rules: vec![RegexRule::Regex {
+				pattern: regex::Regex::new("SECRET").unwrap(),
+			}],
+		}),
+	};
+	let client = crate::test_helpers::policy_client();
+	let headers = ::http::HeaderMap::new();
+
+	let mut prom = prometheus_client::registry::Registry::default();
+	let metrics = std::sync::Arc::new(crate::telemetry::metrics::Metrics::new(
+		&mut prom,
+		frozen_collections::FzHashSet::default(),
+		Default::default(),
+	));
+	// No request snapshot is passed to the evaluator below, which is the common case.
+	let observer = GuardObserver::new(
+		crate::telemetry::capability::CapabilityObserver::new(None, metrics, None),
+		InputFormat::Messages,
+		strng::literal!("openai"),
+		strng::literal!("gpt-4o"),
+	);
+
+	// The model is the resource id, which is deliberately not a metric label and
+	// reaches only the log record, so assert it on the observer directly.
+	assert_eq!(observer.0.resource.resource_id, "gpt-4o");
+	assert_eq!(observer.0.resource.resource_target, "openai");
+	assert_eq!(observer.0.resource.resource_type, "llm.model");
+
+	let mut evaluator = make_evaluator(
+		&guard,
+		client.clone(),
+		headers,
+		None,
+		Default::default(),
+		Some(observer),
+	);
+	let _ = evaluator.evaluate("this window has SECRET").await.unwrap();
+	evaluator.finish_response();
+
+	let mut encoded = String::new();
+	prometheus_client::encoding::text::encode(&mut encoded, &prom).unwrap();
+	let line = encoded
+		.lines()
+		.find(|l| l.starts_with("capability_observations_total{"))
+		.unwrap_or_else(|| panic!("no capability counter in:\n{encoded}"));
+	assert!(line.contains(r#"action="llm:chat""#), "{line}");
+	assert!(line.contains(r#"resource_type="llm.model""#), "{line}");
+	assert!(
+		line.contains(r#"resource_target="openai""#),
+		"the provider must survive an absent request snapshot: {line}"
+	);
+}
+
+/// The capability fold resets its accumulator at each response boundary. The guardrail metric folds
+/// over the evaluator's whole lifetime and must not see that reset: sharing one accumulator made a
+/// blocked stream report `Allow`, because the boundary ran before `Drop` did.
+#[tokio::test]
+async fn streaming_guard_metric_survives_a_response_boundary() {
+	use crate::llm::policy::streaming_guardrails::make_evaluator;
+
+	let guard = ResponseGuard {
+		rejection: Default::default(),
+		scope: default_response_scope(),
+		kind: ResponseGuardKind::Regex(RegexRules {
+			action: Action::Audit,
+			rules: vec![RegexRule::Regex {
+				pattern: regex::Regex::new("SECRET").unwrap(),
+			}],
+		}),
+	};
+	let client = crate::test_helpers::policy_client();
+	let headers = ::http::HeaderMap::new();
+	let mut evaluator = make_evaluator(
+		&guard,
+		client.clone(),
+		headers,
+		None,
+		Default::default(),
+		None,
+	);
+
+	let _ = evaluator.evaluate("this window has SECRET").await.unwrap();
+	// The response closes here, as it would at SSE end of body or on response.done.
+	evaluator.finish_response();
+	drop(evaluator);
+
+	assert_eq!(
+		guardrail_metric(&client, GuardrailPhase::Response, GuardrailAction::Audit),
+		1,
+		"the strongest verdict of the stream must survive the per-response reset"
+	);
+	assert_eq!(
+		guardrail_metric(&client, GuardrailPhase::Response, GuardrailAction::Allow),
+		0,
+		"the reset must not downgrade the recorded verdict to Allow"
+	);
+}
+
+/// A realtime websocket connection drives many responses through one evaluator, so the fold has
+/// to close at each response boundary rather than at the evaluator's lifetime.
+#[tokio::test]
+async fn streaming_guard_records_one_capability_observation_per_response() {
+	use crate::llm::policy::streaming_guardrails::make_evaluator;
+
+	// Sums every `capability_observations_total` series, so a fold that emits the
+	// right number of series with the wrong count still fails.
+	fn observation_count(prom: &prometheus_client::registry::Registry) -> u64 {
+		let mut encoded = String::new();
+		prometheus_client::encoding::text::encode(&mut encoded, prom).unwrap();
+		encoded
+			.lines()
+			.filter(|l| l.starts_with("capability_observations_total{"))
+			.map(|l| {
+				l.rsplit_once("} ")
+					.expect("counter line has a value")
+					.1
+					.parse::<u64>()
+					.expect("counter value is an integer")
+			})
+			.sum()
+	}
+
+	fn encoded(prom: &prometheus_client::registry::Registry) -> String {
+		let mut out = String::new();
+		prometheus_client::encoding::text::encode(&mut out, prom).unwrap();
+		out
+	}
+
+	let guard = ResponseGuard {
+		rejection: Default::default(),
+		scope: default_response_scope(),
+		kind: ResponseGuardKind::Regex(RegexRules {
+			action: Action::Audit,
+			rules: vec![RegexRule::Regex {
+				pattern: regex::Regex::new("SECRET").unwrap(),
+			}],
+		}),
+	};
+	let client = crate::test_helpers::policy_client();
+	let headers = ::http::HeaderMap::new();
+
+	let mut prom = prometheus_client::registry::Registry::default();
+	let metrics = std::sync::Arc::new(crate::telemetry::metrics::Metrics::new(
+		&mut prom,
+		frozen_collections::FzHashSet::default(),
+		Default::default(),
+	));
+	let observer = crate::telemetry::capability::CapabilityObserver::new(None, metrics, None);
+	let observer = GuardObserver::new(
+		observer,
+		InputFormat::Messages,
+		strng::literal!("openai"),
+		strng::literal!("gpt-4o"),
+	);
+
+	let mut evaluator = make_evaluator(
+		&guard,
+		client.clone(),
+		headers,
+		None,
+		Default::default(),
+		Some(observer),
+	);
+
+	let _ = evaluator.evaluate("clean window one").await.unwrap();
+	let _ = evaluator.evaluate("this window has SECRET").await.unwrap();
+	evaluator.finish_response();
+	assert_eq!(
+		observation_count(&prom),
+		1,
+		"the first response emits its observation at its own boundary, got:\n{}",
+		encoded(&prom)
+	);
+
+	let _ = evaluator.evaluate("second response, clean").await.unwrap();
+	let _ = evaluator
+		.evaluate("second response, still clean")
+		.await
+		.unwrap();
+	evaluator.finish_response();
+	assert_eq!(
+		observation_count(&prom),
+		2,
+		"a second response on the same evaluator gets its own observation, got:\n{}",
+		encoded(&prom)
+	);
+
+	evaluator.finish_response();
+	assert_eq!(
+		observation_count(&prom),
+		2,
+		"a boundary with no evaluated window emits nothing, got:\n{}",
+		encoded(&prom)
+	);
+
+	drop(evaluator);
+	assert_eq!(
+		observation_count(&prom),
+		2,
+		"the Drop backstop must not re-emit an already flushed response, got:\n{}",
+		encoded(&prom)
 	);
 }
 
@@ -2538,6 +2849,7 @@ async fn regex_reject_records_guardrail_info() {
 		None,
 		None,
 		Some(&log),
+		None,
 	)
 	.await
 	.unwrap();
@@ -4526,5 +4838,49 @@ mod webhook_mask {
 			let mutation = Policy::webhook_mask_mutation(&sent, reply.clone(), &mut req);
 			assert!(matches!(mutation, RequestGuardMutation::Messages(m) if m == reply));
 		}
+	}
+}
+
+/// `llm_action` must map every `InputFormat` from the typed request kind, not by
+/// sniffing the URL. The old code matched the path against the substring
+/// "embedding", which mislabelled any chat route whose path merely contained
+/// that text, and silently reported every non-chat, non-embedding kind (rerank,
+/// count-tokens, realtime) as `llm:chat`. This is a regression guard for that.
+#[test]
+fn test_llm_action_maps_every_input_format() {
+	use crate::llm::{DetectedOperation as Op, InputFormat};
+
+	for (format, action) in [
+		(InputFormat::Embeddings, "llm:embed"),
+		(InputFormat::Rerank, "llm:rerank"),
+		(InputFormat::Realtime, "llm:realtime"),
+		(InputFormat::CountTokens, "llm:count_tokens"),
+		(InputFormat::GeminiCountTokens, "llm:count_tokens"),
+		(InputFormat::Decisions, "llm:decisions"),
+		(InputFormat::SystemOne, "llm:decisions"),
+		(InputFormat::Completions, "llm:chat"),
+		(InputFormat::Messages, "llm:chat"),
+		(InputFormat::Responses, "llm:chat"),
+		(InputFormat::Gemini, "llm:chat"),
+		(InputFormat::Detect(Some(Op::Chat)), "llm:chat"),
+		(InputFormat::Detect(Some(Op::GenerateContent)), "llm:chat"),
+		(InputFormat::Detect(Some(Op::Embeddings)), "llm:embed"),
+		(
+			InputFormat::Detect(Some(Op::CountTokens)),
+			"llm:count_tokens",
+		),
+		(InputFormat::Detect(Some(Op::Rerank)), "llm:rerank"),
+		(InputFormat::Detect(Some(Op::Decisions)), "llm:decisions"),
+		(InputFormat::Detect(Some(Op::Image)), "llm:image"),
+		(InputFormat::Detect(Some(Op::Ocr)), "llm:ocr"),
+		(
+			InputFormat::Detect(Some(Op::Transcription)),
+			"llm:transcribe",
+		),
+		(InputFormat::Detect(Some(Op::Speech)), "llm:speech"),
+		(InputFormat::Detect(Some(Op::Compaction)), "llm:compact"),
+		(InputFormat::Detect(None), "llm:unknown"),
+	] {
+		assert_eq!(llm_action(format), action, "{format:?}");
 	}
 }

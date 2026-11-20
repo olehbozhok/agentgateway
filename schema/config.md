@@ -126,6 +126,7 @@
 |`config.logging.database.enabled`|boolean|Store request logs in a database. When omitted, request logs are stored if either `url` or<br>`config.database.url` is set, and otherwise not. When true, one of them is required. When<br>false, no request log store is started, even if `config.database` is set.|
 |`config.logging.database.url`|string|Connection URL for the request log database. A postgres:// or postgresql:// URL uses Postgres; any other value is treated as a SQLite database.<br>Defaults to `config.database`.|
 |`config.logging.database.maxConnections`|integer|Maximum number of connections to open in this database's connection pool. Defaults to 5.<br>Can only be set together with `url`. Without a `url`, the `config.database` pool and its limit<br>are used. With a `url`, the pool is shared only when both `url` and `maxConnections` match<br>`config.database`.|
+|`config.logging.capabilityObservations`|boolean|Emit a capability observation at each authorization decision, describing the action and resource that was evaluated. Always increments `agentgateway_capability_observations_total`; the full log record additionally requires an OTLP access log backend on the listener. Off by default: this adds one record per decision, and MCP listings evaluate every advertised tool, prompt, and resource individually.|
 |`config.metrics`|object|Metrics configuration, including metric removal and custom fields.|
 |`config.metrics.remove`|[]string|Metric names to exclude from collection.|
 |`config.metrics.fields`|object|Custom fields to add to all metrics.|

@@ -279,6 +279,16 @@ pub struct ModelAccessPolicy {
 }
 
 impl ModelAccessPolicy {
+	/// Build a policy from the same `allowedModels` patterns an API key configures.
+	/// Test-only: production builds these while parsing the API key policy, and the
+	/// pattern compiler stays private.
+	#[cfg(test)]
+	pub(crate) fn compile(allowed_models: Option<Vec<String>>) -> anyhow::Result<Self> {
+		Ok(Self {
+			allowed_models: AllowedModels::compile(allowed_models)?,
+		})
+	}
+
 	pub fn allows(&self, model: &str) -> bool {
 		self.allowed_models.allows(model)
 	}

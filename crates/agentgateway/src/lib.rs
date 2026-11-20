@@ -498,6 +498,8 @@ pub struct RawLogging {
 	/// Request log database. When omitted (or null), request logs are stored in `config.database`
 	/// if it is set. Set `enabled: false` to turn off request log storage.
 	database: Option<RawLoggingDatabase>,
+	/// Emit a capability observation at each authorization decision, describing the action and resource that was evaluated. Always increments `agentgateway_capability_observations_total`; the full log record additionally requires an OTLP access log backend on the listener. Off by default: this adds one record per decision, and MCP listings evaluate every advertised tool, prompt, and resource individually.
+	capability_observations: Option<bool>,
 }
 
 /// Request log database. Without a `url`, request logs are stored in `config.database`.

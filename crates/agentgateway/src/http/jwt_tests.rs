@@ -816,6 +816,7 @@ fn make_min_req_log() -> crate::telemetry::log::RequestLog {
 	use crate::transport::stream::TCPConnectionInfo;
 
 	let log_cfg = log::Config {
+		capability_observations: false,
 		filter: None,
 		fields: LoggingFields::default(),
 		standard_attributes: Default::default(),

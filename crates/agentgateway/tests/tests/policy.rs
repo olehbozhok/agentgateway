@@ -602,3 +602,91 @@ async fn inline_backend_policies() {
 		b"backend-route-req"
 	);
 }
+
+/// Like `basic_setup`, but with a caller-supplied top-level config so tests can
+/// exercise config flags (e.g. `logging.capabilityObservations`) that
+/// `basic_setup`'s hardcoded `"{}"` never turns on.
+/// Note the `config` wrapper: static settings live under it, and an unknown
+/// top-level key is silently ignored rather than rejected.
+async fn setup_with_config(cfg: Value) -> (MockServer, TestBind, MemoryClient) {
+	let mock = simple_mock().await;
+	let t = setup_proxy_test(&cfg.to_string())
+		.unwrap()
+		.with_backend(*mock.address())
+		.with_bind(simple_bind())
+		.with_route(basic_route(*mock.address()));
+	let io = t.serve_http(BIND_KEY);
+	(mock, t, io)
+}
+
+fn deny_all_gateway_authorization() -> Value {
+	json!({
+		"authorization": {
+			"rules": [
+				{"allow": "request.headers[\"x-pre-routing\"] == \"yes\""}
+			]
+		}
+	})
+}
+
+#[tokio::test]
+async fn capability_observations_are_recorded_when_enabled() {
+	let (_mock, mut bind, io) =
+		setup_with_config(json!({"config": {"logging": {"capabilityObservations": true}}})).await;
+	bind
+		.attach_gateway_policy(deny_all_gateway_authorization())
+		.await;
+
+	let denied = send_request(io, Method::GET, "http://lo/p").await;
+	assert_eq!(denied.status(), 403);
+
+	let metrics = bind.metrics_text();
+	let line = metrics
+		.lines()
+		.find(|l| l.starts_with("agentgateway_capability_observations_total{"))
+		.unwrap_or_else(|| panic!("no capability_observations_total series in scrape:\n{metrics}"));
+	assert!(line.contains(r#"outcome="Deny""#), "{line}");
+	// The HTTP action label is the lowercased method.
+	assert!(line.contains(r#"action="get""#), "{line}");
+	// One request passes several authorization points, so the record has to name
+	// the one that decided; the name comes from the policy wrapper.
+	assert!(
+		line.contains(r#"decision_point="gateway authorization""#),
+		"{line}"
+	);
+	// The capability is keyed on the listener, which is known at every authorization
+	// point, rather than on the route, which gateway scope has not selected yet.
+	assert!(line.contains(r#"resource_type="http.path""#), "{line}");
+	// Qualified by gateway: a bare listener name is local to its gateway, and
+	// unnamed listeners default to `listener{index}`.
+	let target = line
+		.split(r#"resource_target=""#)
+		.nth(1)
+		.and_then(|rest| rest.split('"').next())
+		.unwrap_or_default();
+	assert_eq!(
+		target.matches('/').count(),
+		2,
+		"expected namespace/gateway/listener, got {target:?} in {line}"
+	);
+}
+
+#[tokio::test]
+async fn capability_observations_are_absent_when_disabled() {
+	// Same denied request as above, but with the flag left off (the default
+	// `"{}"` config). This is the assertion that actually proves the flag gates
+	// the feature, rather than the counter always being wired up.
+	let (_mock, mut bind, io) = setup_with_config(json!({})).await;
+	bind
+		.attach_gateway_policy(deny_all_gateway_authorization())
+		.await;
+
+	let denied = send_request(io, Method::GET, "http://lo/p").await;
+	assert_eq!(denied.status(), 403);
+
+	let metrics = bind.metrics_text();
+	assert!(
+		!metrics.contains("agentgateway_capability_observations_total"),
+		"flag is off; scrape should carry no capability series:\n{metrics}"
+	);
+}

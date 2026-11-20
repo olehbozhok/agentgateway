@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use websocket_sans_io::{FrameInfo, Opcode, WebsocketFrameEncoder, WebsocketFrameEvent};
 
-use crate::llm::policy::PromptGuard;
+use crate::llm::policy::{GuardObserver, PromptGuard};
 use crate::llm::{LLMInfo, LLMResponse, TokenGapSummary};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::telemetry::log::AsyncLog;
@@ -368,12 +368,13 @@ pub async fn guarded_realtime_proxy<C, S>(
 	req_headers: ::http::HeaderMap,
 	original: Option<std::sync::Arc<crate::cel::RequestSnapshot>>,
 	guardrail_log: crate::telemetry::log::GuardrailLog,
+	observer: Option<GuardObserver>,
 ) where
 	C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 	S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
 	use crate::llm::policy::streaming_guardrails::{
-		DEFAULT_EVAL_THRESHOLD, OVERLAP_BYTES, evaluate_window, tail_chars,
+		DEFAULT_EVAL_THRESHOLD, OVERLAP_BYTES, evaluate_window, finish_evaluators, tail_chars,
 	};
 
 	let (mut client_reader, mut client_writer_io) = tokio::io::split(client);
@@ -387,6 +388,7 @@ pub async fn guarded_realtime_proxy<C, S>(
 	let request_guardrail_log = guardrail_log.clone();
 	let log_clone = log.clone();
 	let original_clone = original.clone();
+	let observer_clone = observer.clone();
 
 	let client_to_server = {
 		let server_tx = server_tx.clone();
@@ -429,6 +431,7 @@ pub async fn guarded_realtime_proxy<C, S>(
 											&policy_client,
 											original.as_deref(),
 											Some(&request_guardrail_log),
+											observer.as_ref(),
 										)
 										.await
 								{
@@ -459,6 +462,7 @@ pub async fn guarded_realtime_proxy<C, S>(
 				&req_headers,
 				original_clone,
 				guardrail_log,
+				observer_clone,
 			);
 			let mut delta_hold: Vec<Bytes> = Vec::new();
 			let mut pending_text = String::new();
@@ -546,6 +550,9 @@ pub async fn guarded_realtime_proxy<C, S>(
 									}
 								},
 								Some(RealtimeServerEvent::ResponseDone(ref done_event)) => {
+									// One connection carries many responses through the same evaluators, so
+									// this is where each response's guardrail fold closes.
+									finish_evaluators(&mut evaluators);
 									if let Some(usage) = done_event.response.usage.as_ref() {
 										let usage_clone = usage.clone();
 										log_clone.non_atomic_mutate(|r| {

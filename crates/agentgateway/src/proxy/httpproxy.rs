@@ -1761,6 +1761,14 @@ async fn handle_upgrade(
 			let llm = log.llm_response.clone();
 			let llm_info = LLMInfo::new(llm_req.clone(), LLMResponse::default());
 			llm.store(Some(llm_info));
+			let observer = crate::telemetry::capability::CapabilityObserver::from_log(log).map(|o| {
+				crate::llm::policy::GuardObserver::new(
+					o,
+					InputFormat::Realtime,
+					llm_req.provider.clone(),
+					llm_req.request_model.clone(),
+				)
+			});
 			if let Some(guard_context) = realtime_guard_context {
 				parse::websocket::guarded_realtime_proxy(
 					TokioIo::new(req),
@@ -1771,6 +1779,7 @@ async fn handle_upgrade(
 					guard_context.req_headers,
 					guard_context.request_snapshot,
 					log.guardrails.clone(),
+					observer,
 				)
 				.await;
 				return;
@@ -2579,6 +2588,14 @@ async fn make_backend_call(
 		if let Some(path_match) = router.trace_path(&req) {
 			log.add(|log| log.path_match = Some(path_match));
 		}
+		// Model authorization runs inside the router, which has no request log in
+		// scope; hand it the observer the way the MCP router does.
+		if let Some(observer) = log
+			.as_deref()
+			.and_then(crate::telemetry::capability::CapabilityObserver::from_log)
+		{
+			req.extensions_mut().insert(observer);
+		}
 		let client = PolicyClient::new(inputs.clone()).with_parent(&req);
 		let resolved = router
 			.resolve(&mut req, &inputs.model_catalog, &client)
@@ -3234,6 +3251,7 @@ async fn make_backend_call(
 			completion: l.cel.cel_context.needs_llm_completion(),
 			tool_calls: l.cel.cel_context.needs_llm_tool_calls(),
 		},
+		observer: crate::telemetry::capability::CapabilityObserver::from_log(l),
 	});
 	let a2a_type = response_policies.a2a_type.clone();
 

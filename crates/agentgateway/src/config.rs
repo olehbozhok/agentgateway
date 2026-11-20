@@ -615,6 +615,11 @@ pub fn parse_config(
 				.and_then(|l| l.format.clone())
 				.unwrap_or_default(),
 			database: logging_database.clone(),
+			capability_observations: raw
+				.logging
+				.as_ref()
+				.and_then(|l| l.capability_observations)
+				.unwrap_or(false),
 				fields: logging_fields(raw.logging.as_ref().and_then(|f| f.fields.clone()))
 					.ctx("invalid config.logging.fields")?,
 				standard_attributes: Arc::new(arc_swap::ArcSwap::from_pointee(

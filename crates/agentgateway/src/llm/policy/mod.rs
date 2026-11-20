@@ -11,8 +11,13 @@ use crate::http::filters::{BackendRequestTimeout, HeaderModifier};
 use crate::http::jwt::Claims;
 use crate::http::{HeaderOrPseudo, Response, StatusCode};
 use crate::llm::policy::webhook::{MaskActionBody, RequestAction, ResponseAction};
-use crate::llm::{AIError, ContentScope, RequestType, ResponseType};
+use crate::llm::{AIError, ContentScope, InputFormat, RequestType, ResponseType};
+use crate::proxy::dtrace::AuthorizationRuleMode;
 use crate::proxy::httpproxy::PolicyClient;
+use crate::telemetry::capability::{
+	AuthorizationBasis, CapabilityObservation, CapabilityObserver, Outcome, PolicyRef, Principal,
+	Resource,
+};
 use crate::telemetry::log::{GuardrailLog, RequestLog};
 use crate::telemetry::metrics::{GuardrailAction, GuardrailPhase};
 use crate::types::agent::{BackendTrafficPolicy, HeaderMatch, SimpleBackendReferenceWithPolicies};
@@ -67,6 +72,129 @@ fn merge_most_severe_guardrails(log: &GuardrailLog, new: GuardrailLog) {
 			}
 		}
 	});
+}
+
+/// A `CapabilityObserver` plus the capability the LLM request is exercising:
+/// the action from the typed `InputFormat`, and the resource from the provider
+/// and requested model.
+///
+/// All three are read where the guard pipeline is set up, because none of them
+/// is available where a streamed response folds its observation. The resource in
+/// particular cannot come from the request snapshot: `LLMContext` is attached to
+/// the response, while the snapshot reads the request, and the snapshot itself
+/// exists only when some CEL expression asked for one -- so reading it there
+/// gave every LLM observation an empty provider and model, collapsing them onto
+/// one capability id.
+///
+/// `Arc`-wrapped so the (cheaply-cloned) `GuardObserver` stays pointer-sized as
+/// it is threaded through the guard call chain, including into `async fn`
+/// state machines that are already close to their `assert_size` budget.
+#[derive(Clone, Debug)]
+pub struct GuardObserver(Arc<GuardObserverInner>);
+
+#[derive(Debug)]
+struct GuardObserverInner {
+	observer: CapabilityObserver,
+	action: Strng,
+	resource: Resource,
+}
+
+impl GuardObserver {
+	pub fn new(
+		observer: CapabilityObserver,
+		format: InputFormat,
+		provider: Strng,
+		model: Strng,
+	) -> Self {
+		Self(Arc::new(GuardObserverInner {
+			observer,
+			action: llm_action(format),
+			resource: Resource::new("llm.model", provider, model),
+		}))
+	}
+}
+
+/// The capability action for an LLM request kind.
+fn llm_action(format: InputFormat) -> Strng {
+	use crate::llm::DetectedOperation as Op;
+	match format {
+		InputFormat::Embeddings | InputFormat::Detect(Some(Op::Embeddings)) => {
+			strng::literal!("llm:embed")
+		},
+		InputFormat::Rerank | InputFormat::Detect(Some(Op::Rerank)) => strng::literal!("llm:rerank"),
+		InputFormat::Realtime => strng::literal!("llm:realtime"),
+		InputFormat::CountTokens
+		| InputFormat::GeminiCountTokens
+		| InputFormat::Detect(Some(Op::CountTokens)) => strng::literal!("llm:count_tokens"),
+		// SystemOne is translated to the Decisions API before it reaches a provider.
+		InputFormat::Decisions | InputFormat::SystemOne | InputFormat::Detect(Some(Op::Decisions)) => {
+			strng::literal!("llm:decisions")
+		},
+		InputFormat::Completions
+		| InputFormat::Messages
+		| InputFormat::Responses
+		| InputFormat::Gemini
+		| InputFormat::Detect(Some(Op::Chat | Op::GenerateContent)) => strng::literal!("llm:chat"),
+		InputFormat::Detect(Some(Op::Image)) => strng::literal!("llm:image"),
+		InputFormat::Detect(Some(Op::Ocr)) => strng::literal!("llm:ocr"),
+		InputFormat::Detect(Some(Op::Transcription)) => strng::literal!("llm:transcribe"),
+		InputFormat::Detect(Some(Op::Speech)) => strng::literal!("llm:speech"),
+		InputFormat::Detect(Some(Op::Compaction)) => strng::literal!("llm:compact"),
+		// A passthrough request whose path the router did not recognize.
+		InputFormat::Detect(None) => strng::literal!("llm:unknown"),
+	}
+}
+
+/// Emit a capability observation for a guardrail decision. Guardrails are
+/// requirements: a `Reject` maps to a denied capability, everything else is
+/// observed as allow with the guard kind recorded as the policy reference.
+fn record_capability_observation(
+	observer: Option<&GuardObserver>,
+	original: Option<&cel::RequestSnapshot>,
+	guard_kind: &'static str,
+	action: GuardrailAction,
+) {
+	let Some(observer) = observer else { return };
+
+	let outcome = if action == GuardrailAction::Reject {
+		Outcome::Deny
+	} else {
+		Outcome::Allow
+	};
+	let intervened = matches!(
+		action,
+		GuardrailAction::Reject | GuardrailAction::Mask | GuardrailAction::Audit
+	);
+	let obs = CapabilityObservation::new(
+		observer.0.action.clone(),
+		observer.0.resource.clone(),
+		outcome,
+		AuthorizationBasis::Guardrail,
+		strng::literal!("llm guardrail"),
+	)
+	.with_policy_refs(vec![PolicyRef::new(
+		guard_kind,
+		AuthorizationRuleMode::Require,
+		intervened,
+	)])
+	.with_principal(principal_from_snapshot(original));
+	observer.0.observer.observe(&obs);
+}
+
+fn principal_from_snapshot(original: Option<&cel::RequestSnapshot>) -> Option<Principal> {
+	let snapshot = original?;
+	if let Some(claims) = &snapshot.jwt
+		&& let Some(serde_json::Value::String(sub)) = claims.inner.get("sub")
+	{
+		return Some(Principal::new("jwt", sub.clone()));
+	}
+	if let Some(claims) = &snapshot.api_key
+		&& let Some(name) = claims.metadata.get("name").and_then(|v| v.as_str())
+		&& !name.is_empty()
+	{
+		return Some(Principal::new("api_key", name));
+	}
+	None
 }
 
 fn reject_or_audit<M>(audit: bool, rejection: &RequestRejection) -> GuardrailOutcome<M> {
@@ -473,6 +601,13 @@ pub trait StreamingEvaluator: Send {
 	fn failure_mode(&self) -> FailureMode {
 		FailureMode::FailClosed
 	}
+
+	/// Called when one response finishes, so per-response telemetry can be
+	/// emitted and the fold reset. A realtime websocket connection carries many
+	/// responses through one evaluator, so the evaluator's lifetime is not a
+	/// usable boundary; `Drop` is only a backstop for streams that end without
+	/// one (client disconnect, upstream error).
+	fn finish_response(&mut self) {}
 }
 
 /// Outcome returned by a `StreamingEvaluator`.
@@ -599,6 +734,7 @@ impl PromptGuard {
 		client: &crate::proxy::httpproxy::PolicyClient,
 		original: Option<&cel::RequestSnapshot>,
 		guardrail_log: Option<&GuardrailLog>,
+		observer: Option<&GuardObserver>,
 	) -> Option<Bytes> {
 		let headers = ::http::HeaderMap::new();
 		let claims = original.and_then(|s| s.jwt.clone());
@@ -617,6 +753,7 @@ impl PromptGuard {
 				claims.clone(),
 				original,
 				guardrail_log.map(|_| &event_log),
+				observer,
 			)
 			.await
 			{
@@ -672,6 +809,7 @@ impl PromptGuard {
 		http_headers: &HeaderMap,
 		original: Option<Arc<cel::RequestSnapshot>>,
 		guardrail_log: GuardrailLog,
+		observer: Option<GuardObserver>,
 	) -> Vec<Box<dyn StreamingEvaluator>> {
 		self
 			.response
@@ -683,6 +821,7 @@ impl PromptGuard {
 					http_headers.clone(),
 					original.clone(),
 					guardrail_log.clone(),
+					observer.clone(),
 				)
 			})
 			.collect()
@@ -711,6 +850,9 @@ impl PromptGuard {
 			original,
 			guardrail_log,
 			true,
+			// The streaming path folds one observation per response in `ResponseGuardEvaluator`;
+			// observing here would multiply it by the number of windows.
+			None,
 		)
 		.await?;
 		let streaming = match rejection {
@@ -995,6 +1137,7 @@ impl Policy {
 		claims: Option<Claims>,
 		original: Option<&cel::RequestSnapshot>,
 		guardrail_log: Option<&GuardrailLog>,
+		observer: Option<&GuardObserver>,
 	) -> anyhow::Result<Option<(Response, &'static str)>> {
 		if let Some(log) = guardrail_log {
 			log.non_atomic_mutate(|entries| entries.retain(|e| e.phase != "request"));
@@ -1013,6 +1156,7 @@ impl Policy {
 				claims.clone(),
 				original,
 				guardrail_log,
+				observer,
 			)
 			.await?;
 			Self::record_guardrail_trip(client, GuardrailPhase::Request, action);
@@ -1025,6 +1169,7 @@ impl Policy {
 
 	/// Evaluate and enforce one request guard. Provider-specific code only
 	/// produces an evaluation; common code below applies its decision.
+	#[allow(clippy::too_many_arguments)]
 	async fn apply_single_request_guard(
 		guard: &RequestGuard,
 		req: &mut dyn RequestType,
@@ -1033,6 +1178,7 @@ impl Policy {
 		claims: Option<Claims>,
 		original: Option<&cel::RequestSnapshot>,
 		guardrail_log: Option<&GuardrailLog>,
+		observer: Option<&GuardObserver>,
 	) -> anyhow::Result<(GuardrailAction, Option<Response>)> {
 		let (outcome, detail) =
 			match Self::evaluate_single_request_guard(guard, req, http_headers, client, claims, original)
@@ -1052,6 +1198,7 @@ impl Policy {
 			action,
 			detail,
 		);
+		record_capability_observation(observer, original, guard.kind.name(), action);
 		Ok((action, rejection))
 	}
 
@@ -2004,6 +2151,7 @@ impl Policy {
 		guards: &Vec<ResponseGuard>,
 		original: Option<&cel::RequestSnapshot>,
 		guardrail_log: Option<&GuardrailLog>,
+		observer: Option<&GuardObserver>,
 	) -> anyhow::Result<Option<Response>> {
 		for g in guards {
 			let (action, rejection) = Self::apply_single_response_guard(
@@ -2014,6 +2162,7 @@ impl Policy {
 				original,
 				guardrail_log,
 				false,
+				observer,
 			)
 			.await?;
 			Self::record_guardrail_trip(client, GuardrailPhase::Response, action);
@@ -2033,6 +2182,7 @@ impl Policy {
 		original: Option<&cel::RequestSnapshot>,
 		guardrail_log: Option<&GuardrailLog>,
 		streaming: bool,
+		observer: Option<&GuardObserver>,
 	) -> anyhow::Result<(GuardrailAction, Option<Response>)> {
 		let (outcome, detail) =
 			match Self::evaluate_single_response_guard(guard, resp, http_headers, client, original).await
@@ -2057,6 +2207,7 @@ impl Policy {
 			action,
 			detail,
 		);
+		record_capability_observation(observer, original, guard.kind.name(), action);
 		Ok((action, rejection))
 	}
 
