@@ -54,7 +54,7 @@ together or joined.
 
 ## Capability Identity
 
-A capability is an action against a resource:
+A capability is an action against a resource_type:
 
 ```text
 action           tools/call, get, llm:chat, ...
