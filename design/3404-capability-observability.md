@@ -205,7 +205,10 @@ Emitted with log level `info` and target `capability`.
 | `trace.id`, `span.id` | no | Present when a span is active |
 
 The `llm:*` vocabulary is derived from the typed request format, not from the request path: `llm:embed`, `llm:rerank`,
-`llm:realtime`, `llm:count_tokens`, and `llm:chat` for every chat-shaped format. Model authorization uses
+`llm:realtime`, `llm:count_tokens`, `llm:decisions` (Decisions and SystemOne), and `llm:chat` for every chat-shaped
+format. A passthrough request uses the operation the router detected from its path (`llm:image`, `llm:ocr`,
+`llm:transcribe`, `llm:speech`, `llm:compact`, or one of the above), and `llm:unknown` when it detected none. Model
+authorization uses
 `llm:select_model`, since it decides eligibility to use a model rather than describing a turn against it, and it runs
 before a provider is chosen -- which is why its resource carries the model name with no target. The mapping is
 exhaustive over `InputFormat`, so a new request format is a compile error rather than a request silently reported as
